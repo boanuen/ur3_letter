@@ -1,16 +1,12 @@
-# UR3e Letter Writer — ROS 2 MoveIt 2 Demo
+# UR3e Letter Writer — ROS 2 MoveIt 2 
 
-ROS 2 (Humble) package điều khiển cánh tay robot UR3e mô phỏng viết chữ cái bằng chuyển động Cartesian của end-effector, sử dụng MoveIt 2 để lập kế hoạch và thực thi quỹ đạo.
 
 ## Tổng quan
 
-- Robot: **UR3e** (mô phỏng trong Gazebo Ignition)
-- Chữ hỗ trợ: T, L, V, M, N, A, B
-- Chữ mặc định: **T** (2 nét — thanh ngang + thanh dọc)
-- Mỗi chữ được chia thành các nét (stroke); giữa các nét, end-effector nâng lên, di chuyển, rồi hạ xuống vẽ nét tiếp theo
+- Robot: **UR3e** 
+- Chữ: **T** 
+- Mỗi chữ được chia thành các nét; giữa các nét, end-effector nâng lên, di chuyển, rồi hạ xuống vẽ nét tiếp theo
 - Quỹ đạo vẽ hiển thị trên RViz bằng Marker (đường xanh = toàn bộ, đường đỏ = nét vẽ thực)
-
-## Yêu cầu hệ thống
 
 - Ubuntu 22.04 (hoặc WSL2)
 - ROS 2 Humble
@@ -83,7 +79,7 @@ ur3e_letter_writer/
 ├── launch/
 │   └── letter_writer.launch.py      # Launch file chính
 ├── ur3e_letter_writer/
-│   ├── letter_paths.py              # Định nghĩa hình dạng chữ cái (waypoint)
+│   ├── letter_paths.py              # Định nghĩa hình dạng chữ cái 
 │   └── letter_writer_node.py        # Node điều khiển, giao tiếp MoveIt 2
 ├── config/
 │   └── ur_controllers.yaml          # Controller config (nới lỏng tolerance cho WSL2)
