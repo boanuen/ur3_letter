@@ -55,9 +55,12 @@ def generate_launch_description():
     arg('height', 0.16, 'Letter height (m).')
     arg('z_draw', 0.06, 'Pen-down Z height (m).')
     arg('z_lift', 0.11, 'Pen-up / retreat Z height (m).')
-    arg('max_velocity_scaling_factor', 0.15, 'MoveIt velocity scaling (0-1).')
-    arg('max_acceleration_scaling_factor', 0.15, 'MoveIt acceleration scaling (0-1).')
-    arg('start_delay_sec', 8.0, 'Grace period (s) before the control node starts.')
+    arg('max_velocity_scaling_factor', 0.05, 'MoveIt velocity scaling (0-1).')
+    arg('max_acceleration_scaling_factor', 0.05, 'MoveIt acceleration scaling (0-1).')
+    arg('trajectory_time_stretch', 8.0,
+        'Post-plan time-stretch factor to accommodate the slow '
+        'gz_ros2_control proportional controller (gain=0.1).')
+    arg('start_delay_sec', 15.0, 'Grace period (s) before the control node starts.')
     arg('start_control_node', 'true', 'Whether to launch the student control node at all.')
 
     ur_type = LaunchConfiguration('ur_type')
@@ -103,6 +106,7 @@ def generate_launch_description():
             'z_lift': LaunchConfiguration('z_lift'),
             'max_velocity_scaling_factor': LaunchConfiguration('max_velocity_scaling_factor'),
             'max_acceleration_scaling_factor': LaunchConfiguration('max_acceleration_scaling_factor'),
+            'trajectory_time_stretch': LaunchConfiguration('trajectory_time_stretch'),
             'start_delay_sec': LaunchConfiguration('start_delay_sec'),
         }],
     )

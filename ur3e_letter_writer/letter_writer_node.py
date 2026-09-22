@@ -41,10 +41,12 @@ from rclpy.action import ActionClient
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 
 from geometry_msgs.msg import Pose, Point, Quaternion, Vector3
+from sensor_msgs.msg import JointState
 from moveit_msgs.action import ExecuteTrajectory
 from moveit_msgs.msg import (
     BoundingVolume,
     Constraints,
+    JointConstraint,
     MotionPlanRequest,
     OrientationConstraint,
     PositionConstraint,
@@ -97,6 +99,17 @@ class LetterWriterNode(Node):
         self._plan_cli = self.create_client(GetMotionPlan, 'plan_kinematic_path')
         self._execute_cli = ActionClient(self, ExecuteTrajectory, 'execute_trajectory')
 
+        # Subscribe to /joint_states so we can gate on valid data before
+        # asking MoveIt to plan (avoids "empty JointState" race on WSL2).
+        self._joint_state_ok = False
+        self._js_sub = self.create_subscription(
+            JointState, '/joint_states', self._js_callback, 10)
+
+    def _js_callback(self, msg: JointState):
+        if msg.name and len(msg.position) > 0:
+            self._joint_state_ok = True
+            self._latest_js = msg  # keep latest for explicit start_state
+
     # ------------------------------------------------------------------ #
     # Parameters
     # ------------------------------------------------------------------ #
@@ -111,11 +124,12 @@ class LetterWriterNode(Node):
         self.declare_parameter('height', 0.16)
         self.declare_parameter('z_draw', 0.06)
         self.declare_parameter('z_lift', 0.11)
-        self.declare_parameter('max_velocity_scaling_factor', 0.15)
-        self.declare_parameter('max_acceleration_scaling_factor', 0.15)
+        self.declare_parameter('max_velocity_scaling_factor', 0.05)
+        self.declare_parameter('max_acceleration_scaling_factor', 0.05)
         self.declare_parameter('planning_time', 10.0)
         self.declare_parameter('cartesian_eef_step', 0.005)
-        self.declare_parameter('start_delay_sec', 8.0)
+        self.declare_parameter('start_delay_sec', 15.0)
+        self.declare_parameter('trajectory_time_stretch', 8.0)
 
     def _read_parameters(self):
         g = self.get_parameter
@@ -135,6 +149,7 @@ class LetterWriterNode(Node):
             planning_time=g('planning_time').value,
             eef_step=g('cartesian_eef_step').value,
             start_delay=g('start_delay_sec').value,
+            time_stretch=g('trajectory_time_stretch').value,
         )
 
     # ------------------------------------------------------------------ #
@@ -160,7 +175,18 @@ class LetterWriterNode(Node):
                 throttle_duration_sec=5.0,
             )
             rclpy.spin_once(self, timeout_sec=1.0)
-        self.get_logger().info('move_group is ready.')
+        self.get_logger().info('move_group services are ready.')
+
+        # Wait for valid joint states so MoveIt knows the real robot pose.
+        # Without this, MoveIt may plan from an empty/default state, which
+        # produces a trajectory the controller cannot follow.
+        while rclpy.ok() and not self._joint_state_ok:
+            self.get_logger().info(
+                'Waiting for valid /joint_states data...',
+                throttle_duration_sec=2.0,
+            )
+            rclpy.spin_once(self, timeout_sec=0.5)
+        self.get_logger().info('Valid joint states received. Ready to plan.')
 
     # ------------------------------------------------------------------ #
     # Main pipeline
@@ -189,14 +215,24 @@ class LetterWriterNode(Node):
         if traj is None:
             self.get_logger().error('Failed to plan the approach move. Aborting.')
             return
+        traj = self._stretch_trajectory(traj, p['time_stretch'])
         if not self._execute(traj):
             self.get_logger().error('Failed to execute the approach move. Aborting.')
             return
 
+        # Let MoveIt's state monitor catch up with the actual robot pose
+        # after the approach move. Without this, MoveIt may still hold a
+        # stale/empty joint state and compute the Cartesian path from the
+        # wrong configuration (the "empty JointState" bug on WSL2).
+        self.get_logger().info('Settling 3s for state monitor to update...')
+        settle_end = time.time() + 3.0
+        while time.time() < settle_end:
+            rclpy.spin_once(self, timeout_sec=0.25)
+
         # 2) One Cartesian path through every remaining waypoint (draw +
         #    pen-up transitions between strokes).
         self.get_logger().info('Computing Cartesian path for the full letter...')
-        traj, fraction = self._plan_cartesian(waypoints[1:])
+        traj, fraction = self._plan_cartesian(waypoints[1:], use_current_js=True)
         if traj is None or fraction < 0.99:
             self.get_logger().error(
                 f'Cartesian path only {fraction * 100:.1f}% complete '
@@ -204,6 +240,7 @@ class LetterWriterNode(Node):
                 'joint limits, or self-collision. Aborting.')
             return
         self.get_logger().info(f'Cartesian path OK ({fraction * 100:.1f}% complete). Executing...')
+        traj = self._stretch_trajectory(traj, p['time_stretch'])
         if not self._execute(traj):
             self.get_logger().error('Failed to execute the letter trajectory.')
             return
@@ -242,40 +279,147 @@ class LetterWriterNode(Node):
         return Constraints(position_constraints=[pos_constraint],
                             orientation_constraints=[ori_constraint])
 
+    def _joint_centering_constraints(self):
+        """Create path constraints that keep joints away from ±2π extremes.
+
+        Without this, RRTConnect may find approach paths that wrap joints
+        near their ±2π limits.  The Cartesian path planner then starts
+        from that extreme configuration and cannot find IK solutions for
+        the remaining waypoints (the "69% Cartesian path" failure).
+
+        We use ±3π/2 (≈4.71 rad) rather than ±π:
+        - ±π was too tight — the IK solver could not find any valid goal
+          configuration within that range (error 99999).
+        - ±3π/2 still blocks the extreme wrapping (e.g. shoulder_pan
+          at −5.94 rad ≈ −340°) while leaving enough room for the IK
+          solutions that legitimately need joints beyond ±π.
+        """
+        import math
+        joints = [
+            'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
+            'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint',
+        ]
+        half_range = 1.5 * math.pi  # ±4.71 rad ≈ ±270°
+        jcs = []
+        for jn in joints:
+            jc = JointConstraint()
+            jc.joint_name = jn
+            jc.position = 0.0
+            jc.tolerance_above = half_range
+            jc.tolerance_below = half_range
+            jc.weight = 1.0
+            jcs.append(jc)
+        return Constraints(joint_constraints=jcs)
+
     def _plan_pose_goal(self, x, y, z):
         p = self.p
-        req = GetMotionPlan.Request()
-        mpr = MotionPlanRequest()
-        mpr.workspace_parameters = WorkspaceParameters(
-            header=Header(frame_id=p['frame_id']),
-            min_corner=Vector3(x=-1.0, y=-1.0, z=-1.0),
-            max_corner=Vector3(x=1.0, y=1.0, z=1.0),
-        )
-        mpr.start_state = RobotState()  # empty -> "use current state"
-        mpr.goal_constraints = [self._goal_constraints_for_pose(x, y, z)]
-        mpr.group_name = p['planning_group']
-        mpr.num_planning_attempts = 5
-        mpr.allowed_planning_time = p['planning_time']
-        mpr.max_velocity_scaling_factor = p['vel_scale']
-        mpr.max_acceleration_scaling_factor = p['acc_scale']
-        req.motion_plan_request = mpr
 
-        future = self._plan_cli.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=p['planning_time'] + 5.0)
-        if future.result() is None:
-            self.get_logger().error('plan_kinematic_path call timed out / failed.')
-            return None
-        resp = future.result().motion_plan_response
-        if resp.error_code.val != 1:  # moveit_msgs/MoveItErrorCodes.SUCCESS == 1
-            self.get_logger().error(f'Planning failed, error code {resp.error_code.val}.')
-            return None
-        return resp.trajectory
+        # Try with joint-centering constraints first, then fall back to
+        # unconstrained planning if the constraint range is still too
+        # tight for the IK solver.
+        for attempt, use_constraints in enumerate([True, False], 1):
+            req = GetMotionPlan.Request()
+            mpr = MotionPlanRequest()
+            mpr.workspace_parameters = WorkspaceParameters(
+                header=Header(frame_id=p['frame_id']),
+                min_corner=Vector3(x=-1.0, y=-1.0, z=-1.0),
+                max_corner=Vector3(x=1.0, y=1.0, z=1.0),
+            )
+            mpr.start_state = self._build_robot_state_from_js()
+            mpr.goal_constraints = [self._goal_constraints_for_pose(x, y, z)]
+            if use_constraints:
+                mpr.path_constraints = self._joint_centering_constraints()
+            mpr.group_name = p['planning_group']
+            mpr.num_planning_attempts = 10
+            mpr.allowed_planning_time = p['planning_time']
+            mpr.max_velocity_scaling_factor = p['vel_scale']
+            mpr.max_acceleration_scaling_factor = p['acc_scale']
+            req.motion_plan_request = mpr
 
-    def _plan_cartesian(self, waypoints):
+            label = 'with joint constraints' if use_constraints else 'WITHOUT joint constraints (fallback)'
+            self.get_logger().info(f'Planning attempt {attempt}/2 {label}...')
+
+            future = self._plan_cli.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=p['planning_time'] + 5.0)
+            if future.result() is None:
+                self.get_logger().warn('plan_kinematic_path call timed out / failed.')
+                continue
+            resp = future.result().motion_plan_response
+            if resp.error_code.val != 1:
+                self.get_logger().warn(f'Planning failed {label}, error code {resp.error_code.val}.')
+                continue
+            self.get_logger().info(f'Planning succeeded {label}.')
+            return resp.trajectory
+
+        self.get_logger().error('All planning attempts failed.')
+        return None
+
+    def _build_robot_state_from_js(self) -> RobotState:
+        """Build a RobotState from the latest /joint_states message so we
+        can pass an explicit start state to MoveIt instead of relying on
+        its internal current-state monitor (which may have stale data)."""
+        rs = RobotState()
+        if hasattr(self, '_latest_js') and self._latest_js is not None:
+            from sensor_msgs.msg import JointState as JS
+            js = JS()
+            js.header = self._latest_js.header
+            js.name = list(self._latest_js.name)
+            js.position = list(self._latest_js.position)
+            if self._latest_js.velocity:
+                js.velocity = list(self._latest_js.velocity)
+            rs.joint_state = js
+            rs.is_diff = False
+            self.get_logger().info(
+                f'Using explicit start state: '
+                f'{dict(zip(js.name, [f"{v:.4f}" for v in js.position]))}')
+        return rs
+
+    def _stretch_trajectory(self, trajectory, factor: float):
+        """Multiply every time_from_start by *factor* and scale joint
+        velocities / accelerations accordingly.
+
+        **Why this is needed**:  gz_ros2_control's simulated position
+        controller uses ``position_proportional_gain = 0.1``, which means
+        the commanded joint velocity equals ``0.1 × position_error``.
+        MoveIt plans trajectories that assume the controller can track
+        them in real time, but with gain = 0.1 the controller lags far
+        behind.  Stretching the trajectory timeline gives the slow
+        controller enough time to track each waypoint.
+
+        With vel_scale = 0.05 and stretch = 8×:
+            effective joint velocity ≈ 0.05 × 3.14 / 8 ≈ 0.020 rad/s
+            steady-state tracking error ≈ 0.020 / 0.1 = 0.20 rad
+            settling after last point ≈ 7 s  →  well within goal tol.
+        """
+        if factor <= 1.0:
+            return trajectory
+
+        pts = trajectory.joint_trajectory.points
+        self.get_logger().info(
+            f'Stretching trajectory ({len(pts)} points) by {factor:.1f}× ...')
+        for pt in pts:
+            old = pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9
+            new = old * factor
+            pt.time_from_start.sec = int(new)
+            pt.time_from_start.nanosec = int((new - int(new)) * 1e9)
+            if pt.velocities:
+                pt.velocities = [v / factor for v in pt.velocities]
+            if pt.accelerations:
+                pt.accelerations = [a / (factor * factor)
+                                    for a in pt.accelerations]
+        last = pts[-1].time_from_start
+        self.get_logger().info(
+            f'Stretched trajectory duration: {last.sec + last.nanosec*1e-9:.1f}s')
+        return trajectory
+
+    def _plan_cartesian(self, waypoints, use_current_js=False):
         p = self.p
         req = GetCartesianPath.Request()
         req.header = Header(frame_id=p['frame_id'])
-        req.start_state = RobotState()  # "use current state"
+        if use_current_js:
+            req.start_state = self._build_robot_state_from_js()
+        else:
+            req.start_state = RobotState()  # "use current state"
         req.group_name = p['planning_group']
         req.link_name = p['ee_link']
         req.waypoints = [make_pose(w.x, w.y, w.z, PEN_DOWN_ORIENTATION) for w in waypoints]
@@ -296,6 +440,21 @@ class LetterWriterNode(Node):
         return resp.solution, resp.fraction
 
     def _execute(self, trajectory) -> bool:
+        # Compute a generous timeout: stretched trajectory duration + 60 s
+        # settling margin. This prevents hanging forever if the controller
+        # cannot converge, while giving the slow proportional controller
+        # enough time to reach the goal tolerance.
+        pts = trajectory.joint_trajectory.points
+        if pts:
+            last = pts[-1].time_from_start
+            traj_dur = last.sec + last.nanosec * 1e-9
+        else:
+            traj_dur = 30.0
+        exec_timeout = traj_dur + 60.0
+        self.get_logger().info(
+            f'Sending trajectory ({len(pts)} pts, {traj_dur:.1f}s) '
+            f'with execution timeout {exec_timeout:.0f}s ...')
+
         goal = ExecuteTrajectory.Goal()
         goal.trajectory = trajectory
         if not self._execute_cli.wait_for_server(timeout_sec=10.0):
@@ -308,7 +467,13 @@ class LetterWriterNode(Node):
             self.get_logger().error('execute_trajectory goal rejected.')
             return False
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
+        rclpy.spin_until_future_complete(self, result_future,
+                                          timeout_sec=exec_timeout)
+        if not result_future.done():
+            self.get_logger().error(
+                f'Execution timed out after {exec_timeout:.0f}s. '
+                'The slow controller could not converge in time.')
+            return False
         result = result_future.result()
         if result is None:
             self.get_logger().error('execute_trajectory did not return a result.')
