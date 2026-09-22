@@ -67,7 +67,7 @@ Sau khi launch, trong RViz:
 Sửa file `ur3e_letter_writer/letter_writer_node.py`, thay giá trị `self._letter`:
 
 ```python
-self._letter = 'B'  # đổi sang chữ B (hoặc T, L, V, M, N, A)
+self._letter = 'T'  # đổi sang chữ T (hoặc B, L, V, M, N, A)
 ```
 
 Rebuild: `colcon build --packages-select ur3e_letter_writer`
